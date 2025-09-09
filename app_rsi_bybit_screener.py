@@ -1,13 +1,4 @@
-# app_rsi_bybit_screener.py
-# Krypto RSI Screener – Bybit Swap only (4h & 15m)
-# - Holt OHLCV direkt über Bybit v5 REST (category=linear) – KEIN ccxt/market-load mehr
-# - RSI 14 auf (O+H+L+C)/4, Anzeige inkl. Wert (ohne Dezimalstellen)
-# - RSI-Cross 4h: bullish/bearish innerhalb X Stunden (Slider)
-# - EMA 4h: Oberhalb / Unterhalb / Neutral (Close vs EMA 5/10/20/30)
-# - EMA 15m: Bullisch / Bärisch / Neutral (Close vs EMA 5/10/20/30)
-# - EMA-Cross 15m: EMA(5) kreuzt alle (10/20/30) innerhalb X Stunden → bullish/bearish/Nein
-# - Whitelist: Extra Coins (Komma-getrennt) zusätzlich zu Top-N
-# - Optional: Telegram-Alerts (RSI-Cross 4h & EMA-Cross 15m)
+# app_rsi_bybit_screener.py — Bybit v5 REST, schnelle Symbol-Liste & Cache
 
 import os, time, random, requests
 from datetime import datetime, timezone
@@ -17,9 +8,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# -------------------------------------------------
-# Konstanten / Parameter
-# -------------------------------------------------
 RSI_LEN = 14
 RSI_SIG = 14
 OB_DEFAULT = 70
@@ -27,13 +15,10 @@ OS_DEFAULT = 30
 TOP_N_DEFAULT = 250
 
 INTERVAL_MAP = {"4h": "240", "15m": "15"}
-LIMITS = {"4h": 600, "15m": 1000}  # wie bisher
-
+LIMITS = {"4h": 600, "15m": 1000}
 BYBIT_BASE = "https://api.bybit.com"
 
-# -------------------------------------------------
-# Helpers: Berechnungen
-# -------------------------------------------------
+# ---------- math utils ----------
 def ts_to_iso(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).isoformat()
 
@@ -69,20 +54,13 @@ def ema_position_label(df: pd.DataFrame, tf: str) -> str:
 def ema5_crosses_all_within_hours(df_15m: pd.DataFrame, hours_back: int) -> str:
     if df_15m is None or len(df_15m) < 50: return "Nein"
     threshold_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - hours_back * 3600_000
-    e5  = ema(df_15m["close"], 5)
-    e10 = ema(df_15m["close"], 10)
-    e20 = ema(df_15m["close"], 20)
-    e30 = ema(df_15m["close"], 30)
+    e5, e10, e20, e30 = ema(df_15m["close"],5), ema(df_15m["close"],10), ema(df_15m["close"],20), ema(df_15m["close"],30)
     idx = df_15m.index[df_15m["ts"] >= threshold_ms]
     if len(idx) < 2: return "Nein"
-
-    def state(i: int) -> str:
-        if e5.iloc[i] > e10.iloc[i] and e5.iloc[i] > e20.iloc[i] and e5.iloc[i] > e30.iloc[i]:
-            return "above_all"
-        if e5.iloc[i] < e10.iloc[i] and e5.iloc[i] < e20.iloc[i] and e5.iloc[i] < e30.iloc[i]:
-            return "below_all"
+    def state(i):
+        if e5.iloc[i] > e10.iloc[i] and e5.iloc[i] > e20.iloc[i] and e5.iloc[i] > e30.iloc[i]: return "above_all"
+        if e5.iloc[i] < e10.iloc[i] and e5.iloc[i] < e20.iloc[i] and e5.iloc[i] < e30.iloc[i]: return "below_all"
         return "mixed"
-
     last = "Nein"
     for i in range(idx[0]+1, len(df_15m)):
         prev, now = state(i-1), state(i)
@@ -91,7 +69,7 @@ def ema5_crosses_all_within_hours(df_15m: pd.DataFrame, hours_back: int) -> str:
     return last
 
 def rsi_cross_4h_within_hours(df_4h: pd.DataFrame, ob: float, os_: float, sig_len: int, hours_back: int) -> str:
-    if df_4h is None or len(df_4h) < max(3, sig_len + 1): return "Nein"
+    if df_4h is None or len(df_4h) < max(3, sig_len+1): return "Nein"
     threshold_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - hours_back * 3600_000
     idx = df_4h.index[df_4h["ts"] >= threshold_ms]
     start = max(int(idx[0]) if len(idx) else 1, 1)
@@ -105,9 +83,7 @@ def rsi_cross_4h_within_hours(df_4h: pd.DataFrame, ob: float, os_: float, sig_le
             if rsi.iloc[i-1] > sma.iloc[i-1] and rsi.iloc[i] <= sma.iloc[i]: last = "bearish"
     return last
 
-# -------------------------------------------------
-# API / Data
-# -------------------------------------------------
+# ---------- config / secrets ----------
 load_dotenv()
 CMC_KEY = os.getenv("CMC_API_KEY", "") or st.secrets.get("CMC_API_KEY", "")
 TG_BOT_TOKEN_DEFAULT = os.getenv("TELEGRAM_BOT_TOKEN", "") or st.secrets.get("TELEGRAM_BOT_TOKEN", "")
@@ -116,22 +92,43 @@ TG_CHAT_ID_DEFAULT   = os.getenv("TELEGRAM_CHAT_ID", "")   or st.secrets.get("TE
 @st.cache_resource(show_spinner=False)
 def get_http_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "krypto-rsi-screener/1.0"})
+    s.headers.update({"User-Agent": "krypto-rsi-screener/1.1"})
     return s
 
-def bybit_get_kline(symbol: str, tf: str, limit: int = 500, max_tries: int = 8) -> Optional[pd.DataFrame]:
+# ---------- Bybit REST helpers ----------
+@st.cache_data(ttl=3600, show_spinner=False)
+def bybit_linear_symbol_map() -> Dict[str, str]:
     """
-    Holt Klines für 'symbol' (z.B. 'BTCUSDT') & timeframe ('4h'|'15m').
-    Robust gg. Rate-Limits (Retry + Backoff). Rückgabe: DataFrame oder None.
+    Holt EINMAL alle linearen Perps von Bybit (USDT/USDC) und baut:
+      map[BASE] = SYMBOL (z.B. BTC -> BTCUSDT)
+    Damit sparen wir tausende Probier-Calls.
     """
     session = get_http_session()
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": INTERVAL_MAP[tf],
-        "limit": min(limit, 1000),
-    }
+    params = {"category": "linear", "limit": 1000}
     delay = 0.7
+    for _ in range(10):
+        try:
+            r = session.get(f"{BYBIT_BASE}/v5/market/instruments-info", params=params, timeout=15)
+            js = r.json()
+            if str(js.get("retCode")) == "0":
+                res = js.get("result", {})
+                lst = res.get("list", []) or []
+                mp = {}
+                for x in lst:
+                    sym = str(x.get("symbol","")).upper()
+                    # symbol endet meist auf USDT/USDC → BASE ist Prefix
+                    base = sym.replace("USDT","").replace("USDC","")
+                    if base and (sym.endswith("USDT") or sym.endswith("USDC")):
+                        mp[base] = sym
+                return mp
+        except requests.RequestException:
+            time.sleep(delay + random.random()*0.3); delay = min(delay*1.8, 6.0)
+    return {}
+
+def bybit_get_kline(symbol: str, tf: str, limit: int = 500, max_tries: int = 8) -> Optional[pd.DataFrame]:
+    session = get_http_session()
+    params = {"category":"linear","symbol":symbol,"interval":INTERVAL_MAP[tf],"limit":min(limit,1000)}
+    delay = 0.5
     for _ in range(max_tries):
         try:
             r = session.get(f"{BYBIT_BASE}/v5/market/kline", params=params, timeout=15)
@@ -139,59 +136,38 @@ def bybit_get_kline(symbol: str, tf: str, limit: int = 500, max_tries: int = 8) 
             if str(js.get("retCode")) == "0":
                 lst = js.get("result", {}).get("list", [])
                 if not lst: return None
-                # Bybit liefert in absteigender Reihenfolge → aufsteigend sortieren
-                rows = [
-                    [int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])]
-                    for x in reversed(lst)
-                ]
+                rows = [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in reversed(lst)]
                 df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
                 df["iso"] = df["ts"].apply(ts_to_iso)
                 return df
-            else:
-                # Symbol nicht existent o.ä.
-                return None
+            return None
         except requests.RequestException:
-            time.sleep(delay + random.random()*0.3)
-            delay = min(delay * 1.8, 6.0)
+            time.sleep(delay + random.random()*0.2); delay = min(delay*1.8, 5.0)
     return None
 
-def resolve_bybit_symbol(base: str) -> Optional[str]:
-    """
-    Probiert <BASE>USDT, dann <BASE>USDC – wenn eines Klines liefert, ist es unser Symbol.
-    """
-    for quote in ("USDT", "USDC"):
-        sym = f"{base}{quote}"
-        df = bybit_get_kline(sym, "4h", limit=5, max_tries=4)
-        if df is not None:
-            return sym
-    return None
-
+# ---------- Universe ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_top_symbols(limit: int = 250) -> List[str]:
-    # CMC (mit Key) oder Coingecko (Fallback)
     try:
         if CMC_KEY:
             url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-            params = {"start": 1, "limit": limit, "convert": "USD"}
+            params = {"start":1,"limit":limit,"convert":"USD"}
             headers = {"X-CMC_PRO_API_KEY": CMC_KEY}
             js = requests.get(url, params=params, headers=headers, timeout=30).json()
             return [x["symbol"].upper() for x in js.get("data", [])][:limit]
         else:
             url = "https://api.coingecko.com/api/v3/coins/markets"
-            params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": min(limit, 250), "page": 1}
+            params = {"vs_currency":"usd","order":"market_cap_desc","per_page":min(limit,250),"page":1}
             data = requests.get(url, params=params, timeout=30).json()
             out, seen = [], set()
             for x in data:
                 s = str(x.get("symbol","")).upper()
-                if s and s not in seen:
-                    seen.add(s); out.append(s)
+                if s and s not in seen: seen.add(s); out.append(s)
             return out[:limit]
     except Exception:
         return []
 
-# -------------------------------------------------
-# Alerts
-# -------------------------------------------------
+# ---------- Alerts ----------
 def send_telegram(bot_token: str, chat_id: str, text: str):
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -199,49 +175,39 @@ def send_telegram(bot_token: str, chat_id: str, text: str):
     except Exception:
         pass
 
-# -------------------------------------------------
-# Screening
-# -------------------------------------------------
-def analyze_base(base: str, ob: int, os_: int, rsi_cross_4h_hours: int, ema_cross_15m_hours: int) -> Optional[Dict]:
-    bybit_sym = resolve_bybit_symbol(base)
-    if not bybit_sym:
+# ---------- Screening ----------
+def analyze_base(base: str, sym_map: Dict[str,str], ob: int, os_: int, rsi_h: int, ema_h: int) -> Optional[Dict]:
+    sym = sym_map.get(base)
+    if not sym: 
         return None
 
-    out = {
-        "Coin": base, "Preis": None,
-        "RSI 4h": "", "RSI 15m": "",
-        "RSI-Cross 4h": "Nein",
-        "EMA 5/10/20/30 (4h)": "Neutral",
-        "EMA 5/10/20/30 (15m)": "Neutral",
-        "EMA-Cross 15m": "Nein"
-    }
+    out = {"Coin": base, "Preis": None,
+           "RSI 4h":"", "RSI 15m":"",
+           "RSI-Cross 4h":"Nein",
+           "EMA 5/10/20/30 (4h)":"Neutral",
+           "EMA 5/10/20/30 (15m)":"Neutral",
+           "EMA-Cross 15m":"Nein"}
 
-    # 4h laden
-    df4 = bybit_get_kline(bybit_sym, "4h", LIMITS["4h"])
-    if df4 is None: 
-        return None
+    df4 = bybit_get_kline(sym, "4h", LIMITS["4h"])
+    if df4 is None: return None
     out["Preis"] = float(df4["close"].iloc[-1])
     df4["rsi"] = rsi_series_typical(df4["open"], df4["high"], df4["low"], df4["close"], RSI_LEN)
     out["RSI 4h"] = rsi_state_and_label(float(df4["rsi"].iloc[-1]), ob, os_)
     out["EMA 5/10/20/30 (4h)"] = ema_position_label(df4, "4h")
-    out["RSI-Cross 4h"] = rsi_cross_4h_within_hours(df4, ob, os_, RSI_SIG, rsi_cross_4h_hours)
+    out["RSI-Cross 4h"] = rsi_cross_4h_within_hours(df4, ob, os_, RSI_SIG, rsi_h)
 
-    # 15m nur laden, wenn überhaupt sinnvoll (wir laden trotzdem immer – du wolltest beide TF)
-    df15 = bybit_get_kline(bybit_sym, "15m", LIMITS["15m"])
+    df15 = bybit_get_kline(sym, "15m", LIMITS["15m"])
     if df15 is not None:
         df15["rsi"] = rsi_series_typical(df15["open"], df15["high"], df15["low"], df15["close"], RSI_LEN)
         out["RSI 15m"] = rsi_state_and_label(float(df15["rsi"].iloc[-1]), ob, os_)
         out["EMA 5/10/20/30 (15m)"] = ema_position_label(df15, "15m")
-        out["EMA-Cross 15m"] = ema5_crosses_all_within_hours(df15, ema_cross_15m_hours)
+        out["EMA-Cross 15m"] = ema5_crosses_all_within_hours(df15, ema_h)
 
-    # nur listen, wenn 4h ODER 15m OB/OS
     if out["RSI 4h"] or out["RSI 15m"]:
         return out
     return None
 
-# -------------------------------------------------
-# UI
-# -------------------------------------------------
+# ---------- UI ----------
 st.set_page_config(page_title="Krypto RSI Screener – Bybit Swap only (4h & 15m)", layout="wide")
 st.title("Krypto RSI Screener – Bybit Swap only (4h & 15m)")
 st.caption("RSI auf (O+H+L+C)/4, Länge 14, SMA(14)-Signal. Zeilenfärbung: beide TF überkauft = rot, beide TF überverkauft = grün.")
@@ -270,17 +236,28 @@ with st.sidebar:
     run_btn = st.button("Jetzt scannen ✅")
 
 if run_btn:
+    # 1) Universum bauen
     bases = fetch_top_symbols(top_n)
     if extra_symbols:
         for sym in [s.strip() for s in extra_symbols.split(",") if s.strip()]:
-            if sym not in bases:
-                bases.append(sym)
+            if sym not in bases: bases.append(sym)
+
+    # 2) Einmalige Symbol-Map von Bybit (schnell & gecacht)
+    sym_map = bybit_linear_symbol_map()
+    if not sym_map:
+        st.error("Konnte Bybit-Instrumente nicht laden. Bitte später erneut versuchen.")
+        st.stop()
+
+    # nur Coins scannen, die Bybit wirklich hat
+    candidates = [b for b in bases if b in sym_map]
+    if not candidates:
+        st.warning("Keine der ausgewählten Top-Coins sind als Bybit-Perps verfügbar.")
+        st.stop()
 
     rows, alert_msgs = [], []
     prog = st.progress(0.0)
-
-    for i, b in enumerate(bases, 1):
-        res = analyze_base(b, ob, os_, rsi_cross_4h_hours, ema_cross_15m_hours)
+    for i, b in enumerate(candidates, 1):
+        res = analyze_base(b, sym_map, ob, os_, rsi_cross_4h_hours, ema_cross_15m_hours)
         if res:
             rows.append(res)
             if tg_enable and tg_token and tg_chat:
@@ -288,31 +265,23 @@ if run_btn:
                     alert_msgs.append(f"RSI-Cross 4h {res['RSI-Cross 4h'].upper()} – {b} @ {res['Preis']}")
                 if res["EMA-Cross 15m"] != "Nein":
                     alert_msgs.append(f"EMA-Cross 15m {res['EMA-Cross 15m'].upper()} – {b} @ {res['Preis']}")
-        prog.progress(i/len(bases))
-        # kleine Pause gegen Ratelimit (Bybit v5 erlaubt recht viel; 0.1–0.2s macht es robust)
-        time.sleep(0.12)
+        prog.progress(i/len(candidates))
+        time.sleep(0.08)  # ganz kleine Pause, sehr konservativ
 
     if not rows:
-        st.warning("Keine Treffer (OB/OS) gefunden.")
+        st.info("Es gab diesmal keine OB/OS-Treffer unter den verfügbaren Bybit-Coins.")
         st.stop()
 
     if tg_enable and tg_token and tg_chat and alert_msgs:
         send_telegram(tg_token, tg_chat, "📣 RSI/EMA Alerts:\n" + "\n".join(f"• {m}" for m in alert_msgs))
 
     df = pd.DataFrame(rows)
-
-    # Confluence nur zur Sortierung
     same = ((df["RSI 4h"].str.startswith("Überkauft")) & (df["RSI 15m"].str.startswith("Überkauft"))) | \
            ((df["RSI 4h"].str.startswith("Überverkauft")) & (df["RSI 15m"].str.startswith("Überverkauft")))
     df = df.assign(_conf=same.astype(int)).sort_values(by=["_conf"], ascending=False)
+    if not show_all and len(df) > 100: df = df.head(100)
 
-    if not show_all and len(df) > 100:
-        df = df.head(100)
-
-    df = df[[
-        "Coin","Preis","RSI 4h","RSI 15m","RSI-Cross 4h",
-        "EMA 5/10/20/30 (4h)","EMA 5/10/20/30 (15m)","EMA-Cross 15m"
-    ]]
+    df = df[["Coin","Preis","RSI 4h","RSI 15m","RSI-Cross 4h","EMA 5/10/20/30 (4h)","EMA 5/10/20/30 (15m)","EMA-Cross 15m"]]
 
     def row_bg(row):
         if row["RSI 4h"].startswith("Überkauft") and row["RSI 15m"].startswith("Überkauft"):
@@ -327,9 +296,7 @@ if run_btn:
         return ""
 
     st.success(f"{len(df)} Treffer")
-    st.dataframe(
-        df.style.apply(row_bg, axis=1).applymap(val_color, subset=["RSI 4h","RSI 15m"]),
-        use_container_width=True, hide_index=True
-    )
+    st.dataframe(df.style.apply(row_bg, axis=1).applymap(val_color, subset=["RSI 4h","RSI 15m"]),
+                 use_container_width=True, hide_index=True)
 else:
     st.info("Konfiguriere links die Filter & klicke **Jetzt scannen**.")
